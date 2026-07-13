@@ -1,0 +1,77 @@
+name: "Agent: Dispatcher"
+
+# Single entry point for all agent dispatches.
+# Routes to the correct minubia-os workflow based on label name.
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch agent
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          LABEL: ${{ github.event.label.name }}
+          ISSUE_NUM: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          case "$LABEL" in
+            analysis)
+              gh workflow run spec-writer.yml \
+                --repo minubia/minubia-os \
+                -f issue_number=$ISSUE_NUM \
+                -f repository=$REPO
+              echo "Dispatched Spec Writer for issue #$ISSUE_NUM"
+              ;;
+
+            spec-written)
+              gh workflow run spec-verifier.yml \
+                --repo minubia/minubia-os \
+                -f issue_number=$ISSUE_NUM \
+                -f repository=$REPO
+              echo "Dispatched Spec Verifier for issue #$ISSUE_NUM"
+              ;;
+
+            spec-verified|needs-revision)
+              gh workflow run code-writer.yml \
+                --repo minubia/minubia-os \
+                -f issue_number=$ISSUE_NUM \
+                -f repository=$REPO
+              echo "Dispatched Code Writer for issue #$ISSUE_NUM"
+              ;;
+
+            ready-for-review)
+              PR_NUM=$(gh api repos/$REPO/issues/$ISSUE_NUM \
+                --jq '.body' | grep -oE '\*\*PR:\*\* #[0-9]+' | grep -oE '[0-9]+' | head -1)
+              if [ -z "$PR_NUM" ]; then
+                echo "No PR found in issue body — skipping"
+                exit 0
+              fi
+              gh workflow run pr-verifier.yml \
+                --repo minubia/minubia-os \
+                -f pr_number=$PR_NUM \
+                -f repository=$REPO
+              echo "Dispatched PR Verifier for PR #$PR_NUM"
+              ;;
+
+            ready-for-test)
+              PR_NUM=$(gh api repos/$REPO/issues/$ISSUE_NUM \
+                --jq '.body' | grep -oE '\*\*PR:\*\* #[0-9]+' | grep -oE '[0-9]+' | head -1)
+              if [ -z "$PR_NUM" ]; then
+                echo "No PR found in issue body — skipping"
+                exit 0
+              fi
+              gh workflow run test-verifier.yml \
+                --repo minubia/minubia-os \
+                -f pr_number=$PR_NUM \
+                -f repository=$REPO
+              echo "Dispatched Test Verifier for PR #$PR_NUM"
+              ;;
+
+            *)
+              echo "Label '$LABEL' does not trigger any agent — skipping"
+              ;;
+          esac
