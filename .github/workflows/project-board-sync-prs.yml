@@ -1,0 +1,100 @@
+name: "Project Board: Sync Column via PR Labels"
+
+# Moves the linked issue to the correct column when PR labels are applied.
+#
+# PR label → linked issue column:
+#   agent-generated → _In progress 🎧
+#   tests-updated   → Work queue 🎯
+#
+# Requires the PR body to reference the issue with a closing keyword:
+#   e.g. "Closes #42" or "Fixes #42"
+
+on:
+  pull_request:
+    types: [labeled]
+
+env:
+  PROJECT_ID: ${{ vars.PROJECT_ID || 'PVT_kwDOAA3tOc4AisI3' }}
+  STATUS_FIELD_ID: ${{ vars.PROJECT_STATUS_FIELD_ID || 'PVTSSF_lADOAA3tOc4AisI3zgbKubk' }}
+  COL_IN_PROGRESS: "3587b9d0"
+  COL_WORK_QUEUE: "617b94e9"
+
+jobs:
+  sync-linked-issue:
+    if: |
+      github.event.label.name == 'agent-generated' ||
+      github.event.label.name == 'tests-updated'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine target column
+        id: target
+        run: |
+          case "${{ github.event.label.name }}" in
+            agent-generated) echo "col=$COL_IN_PROGRESS" >> $GITHUB_OUTPUT ;;
+            tests-updated)   echo "col=$COL_WORK_QUEUE"  >> $GITHUB_OUTPUT ;;
+          esac
+
+      - name: Get linked issue and project item ID
+        id: item
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          RESULT=$(gh api graphql -f query='
+            query($owner: String!, $repo: String!, $pr: Int!) {
+              repository(owner: $owner, name: $repo) {
+                pullRequest(number: $pr) {
+                  closingIssuesReferences(first: 5) {
+                    nodes {
+                      number
+                      projectItems(first: 10) {
+                        nodes {
+                          id
+                          project { id }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }' \
+            -f owner="${{ github.repository_owner }}" \
+            -f repo="${{ github.event.repository.name }}" \
+            -F pr=${{ github.event.pull_request.number }})
+
+          ITEM_ID=$(echo "$RESULT" | jq -r \
+            '.data.repository.pullRequest.closingIssuesReferences.nodes[].projectItems.nodes[] | select(.project.id == "'"$PROJECT_ID"'") | .id' \
+            | head -1)
+
+          ISSUE_NUMBER=$(echo "$RESULT" | jq -r \
+            '.data.repository.pullRequest.closingIssuesReferences.nodes[0].number // empty')
+
+          if [ -z "$ITEM_ID" ]; then
+            echo "No linked issue found in project board for PR #${{ github.event.pull_request.number }} — skipping"
+            exit 0
+          fi
+
+          echo "item_id=$ITEM_ID" >> $GITHUB_OUTPUT
+          echo "issue_number=$ISSUE_NUMBER" >> $GITHUB_OUTPUT
+
+      - name: Move linked issue to column
+        if: steps.item.outputs.item_id != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh api graphql -f query='
+            mutation($project: ID!, $item: ID!, $field: ID!, $value: String!) {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: $project
+                itemId: $item
+                fieldId: $field
+                value: { singleSelectOptionId: $value }
+              }) {
+                projectV2Item { id }
+              }
+            }' \
+            -f project="$PROJECT_ID" \
+            -f item="${{ steps.item.outputs.item_id }}" \
+            -f field="$STATUS_FIELD_ID" \
+            -f value="${{ steps.target.outputs.col }}"
+
+          echo "Moved issue #${{ steps.item.outputs.issue_number }} via PR #${{ github.event.pull_request.number }} (label: ${{ github.event.label.name }})"
