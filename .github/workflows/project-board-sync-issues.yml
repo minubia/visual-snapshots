@@ -1,0 +1,122 @@
+name: "Project Board: Sync Issue Column"
+
+# Moves issues to the correct project board column when labels are applied.
+#
+# Label → Column mapping:
+#   analysis     → Analysis 🔎
+#   spec-verified → Work queue 🎯
+#   in-progress  → _In progress 🎧
+#   staging      → Staging 🤩
+
+on:
+  issues:
+    types: [labeled]
+
+env:
+  PROJECT_ID: ${{ vars.PROJECT_ID || 'PVT_kwDOAA3tOc4AisI3' }}
+  STATUS_FIELD_ID: ${{ vars.PROJECT_STATUS_FIELD_ID || 'PVTSSF_lADOAA3tOc4AisI3zgbKubk' }}
+  # Column option IDs
+  COL_ANALYSIS: "8b677c51"
+  COL_WORK_QUEUE: "617b94e9"
+  COL_IN_PROGRESS: "3587b9d0"
+  COL_REVIEW: "ce7390af"
+  COL_STAGING: "8b6693c8"
+
+jobs:
+  sync-column:
+    if: |
+      github.event.label.name == 'analysis' ||
+      github.event.label.name == 'spec-verified' ||
+      github.event.label.name == 'ready-for-test' ||
+      github.event.label.name == 'ready-for-review' ||
+      github.event.label.name == 'staging'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine target column
+        id: target
+        run: |
+          case "${{ github.event.label.name }}" in
+            analysis)        echo "col=$COL_ANALYSIS"    >> $GITHUB_OUTPUT ;;
+            spec-verified)   echo "col=$COL_WORK_QUEUE"  >> $GITHUB_OUTPUT ;;
+            ready-for-test)  echo "col=$COL_IN_PROGRESS" >> $GITHUB_OUTPUT ;;
+            ready-for-review) echo "col=$COL_REVIEW"     >> $GITHUB_OUTPUT ;;
+            staging)         echo "col=$COL_STAGING"     >> $GITHUB_OUTPUT ;;
+          esac
+
+      - name: Get project item ID
+        id: item
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          ITEM_ID=$(gh api graphql -f query='
+            query($owner: String!, $repo: String!, $issue: Int!) {
+              repository(owner: $owner, name: $repo) {
+                issue(number: $issue) {
+                  projectItems(first: 10) {
+                    nodes {
+                      id
+                      project { id }
+                    }
+                  }
+                }
+              }
+            }' \
+            -f owner="${{ github.repository_owner }}" \
+            -f repo="${{ github.event.repository.name }}" \
+            -F issue=${{ github.event.issue.number }} \
+            --jq '.data.repository.issue.projectItems.nodes[] | select(.project.id == "'"$PROJECT_ID"'") | .id')
+
+          if [ -z "$ITEM_ID" ]; then
+            echo "Issue #${{ github.event.issue.number }} not found in project board — skipping"
+            exit 0
+          fi
+          echo "item_id=$ITEM_ID" >> $GITHUB_OUTPUT
+
+      - name: Move issue and linked PR to column
+        if: steps.item.outputs.item_id != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          move_item() {
+            local item_id=$1
+            gh api graphql -f query='
+              mutation($project: ID!, $item: ID!, $field: ID!, $value: String!) {
+                updateProjectV2ItemFieldValue(input: {
+                  projectId: $project
+                  itemId: $item
+                  fieldId: $field
+                  value: { singleSelectOptionId: $value }
+                }) { projectV2Item { id } }
+              }' \
+              -f project="$PROJECT_ID" \
+              -f item="$item_id" \
+              -f field="$STATUS_FIELD_ID" \
+              -f value="${{ steps.target.outputs.col }}" > /dev/null
+          }
+
+          # Move issue
+          move_item "${{ steps.item.outputs.item_id }}"
+          echo "Moved issue #${{ github.event.issue.number }} (label: ${{ github.event.label.name }})"
+
+          # Find linked PR from issue body (**PR:** #123)
+          ISSUE_BODY=$(gh api repos/${{ github.repository }}/issues/${{ github.event.issue.number }} --jq '.body')
+          PR_NUM=$(echo "$ISSUE_BODY" | grep -oE '\*\*PR:\*\* #[0-9]+' | grep -oE '[0-9]+' | head -1)
+
+          if [ -z "$PR_NUM" ]; then echo "No linked PR found — skipping PR move"; exit 0; fi
+
+          # Get PR node ID and add to project if needed, then move
+          PR_NODE_ID=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM --jq '.node_id' 2>/dev/null)
+          if [ -z "$PR_NODE_ID" ]; then echo "PR #$PR_NUM not found — skipping"; exit 0; fi
+
+          PR_ITEM_ID=$(gh api graphql -f query='
+            mutation($project: ID!, $content: ID!) {
+              addProjectV2ItemById(input: { projectId: $project, contentId: $content }) {
+                item { id }
+              }
+            }' \
+            -f project="$PROJECT_ID" \
+            -f content="$PR_NODE_ID" \
+            --jq '.data.addProjectV2ItemById.item.id')
+
+          move_item "$PR_ITEM_ID"
+          echo "Moved PR #$PR_NUM to same column"
